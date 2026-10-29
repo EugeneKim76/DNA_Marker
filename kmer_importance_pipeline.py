@@ -10,6 +10,28 @@ marker_candidates_cdhit_sort.tsv 자동 생성
   기존 코드의 importance_df / importance_df2 구분은 같은 정보의 중복이었으므로
   본 코드에서는 타겟 종 방향 단일 결과만 출력.
 
+  CD-HIT 대표 서열 선정:
+  cd-hit이 클러스터 내에서 임의로(최초 입력 순서 기준) 고르는 대표 서열 대신,
+  .clstr 파일로 클러스터 멤버십을 확인하여 각 클러스터 내 shap_importance가
+  가장 큰 멤버를 대표 서열로 선정한다 (run_cdhit_sort 참고).
+
+  seq_id 안정화:
+  기존에는 seq_id가 fold 결과를 이어붙인 DataFrame의 행 번호였으므로,
+  top_n/n_splits 등 파라미터에 따라 동일 서열이라도 FASTA 내 등장 위치가
+  달라져 seq_id 값이 달라질 수 있었다(서열·SHAP 값 자체는 변하지 않음).
+  이를 명확히 하기 위해 seq_id를 k-mer 서열의 해시값으로 변경하여,
+  동일 서열은 파라미터와 무관하게 항상 동일한 ID를 갖도록 하였다
+  (records_to_fasta 참고).
+
+  동점 순위 안정화:
+  최종 정렬(run_cdhit_sort)이 SHAP 값만으로 정렬할 경우, 동일한 SHAP 값을
+  가진 서열들 사이의 상대 순서는 Python stable sort 특성상 "정렬 전 리스트
+  순서"에 의존한다. 이 정렬 전 순서는 .clstr/FASTA 내 등장 순서에서 오므로
+  top_n/n_splits가 바뀌면 동점 서열 그룹 내부의 등장 순서(= TSV 상 몇
+  번째 줄인지)가 달라질 수 있었다(SHAP 값 자체는 동일). 이를 막기 위해
+  정렬 키에 seq_id(서열 해시)를 2차 키로 추가하여, 동점 그룹 내 순서까지
+  입력 파라미터와 무관하게 고정하였다.
+
 사용 예:
     python kmer_importance_pipeline.py \
         --input      ML_table2.csv \
@@ -22,6 +44,7 @@ marker_candidates_cdhit_sort.tsv 자동 생성
 """
 
 import argparse
+import hashlib
 import sys
 import subprocess
 import time
@@ -155,13 +178,32 @@ def run_shap_cv(X, y, pos_label,
 # 3. TSV / FASTA 생성
 # ──────────────────────────────────────────────
 
+def _seq_hash_id(sequence, length=12):
+    """
+    k-mer 서열 자체로부터 결정적(deterministic) ID를 생성.
+    동일 서열은 top_n, fold 구성, 등장 순서와 무관하게 항상 동일 ID를 가지므로
+    seq_id가 "DataFrame 내 행 번호"였던 기존 방식과 달리 입력 파라미터에
+    의존하지 않는 안정적인 식별자가 된다.
+    """
+    return hashlib.md5(sequence.encode("utf-8")).hexdigest()[:length]
+
+
 def records_to_fasta(records, fa_path):
-    """fold별 top-N DataFrame을 합쳐 FASTA로 저장."""
+    """
+    fold별 top-N DataFrame을 합쳐 FASTA로 저장.
+
+    seq_id는 행 번호(iterrows 인덱스)가 아니라 k-mer 서열의 해시값을 사용한다.
+    기존 방식(행 번호)은 top_n/n_splits 등 입력 파라미터에 따라 동일 서열이라도
+    FASTA 내 등장 위치(= 행 번호)가 달라져, 로그나 TSV 상에서 같은 서열이
+    다른 ID로 보이는 혼란을 유발할 수 있었다. 서열 해시는 이 문제를 없앤다.
+    """
     combined = pd.concat(records, ignore_index=True)
     with open(fa_path, "w") as f:
-        for idx, row in combined.iterrows():
+        for _, row in combined.iterrows():
+            seq = row["column_name"]
+            seq_id = _seq_hash_id(seq)
             f.write(">{}\t{:.6f}\n{}\n".format(
-                idx, row["shap_importance"], row["column_name"]))
+                seq_id, row["shap_importance"], seq))
     log("  FASTA 저장: {} ({} 항목)".format(fa_path, len(combined)))
     return combined
 
@@ -170,9 +212,77 @@ def records_to_fasta(records, fa_path):
 # 4. CD-HIT 클러스터링 + 정렬
 # ──────────────────────────────────────────────
 
+def _parse_fasta_with_shap(path):
+    """
+    comment(2번째 필드)에 shap_importance가 들어있는 FASTA를 파싱.
+    반환: {seq_id: (shap_importance, sequence)}
+    """
+    records = {}
+    seq_id = comment = seq = None
+
+    def _flush():
+        if seq_id is None:
+            return
+        try:
+            shap_val = float(comment.strip())
+        except ValueError:
+            shap_val = 0.0
+        records[seq_id] = (shap_val, seq)
+
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip()
+            if line.startswith(">"):
+                _flush()
+                parts = line[1:].split("\t", 1)
+                seq_id  = parts[0]
+                comment = parts[1] if len(parts) > 1 else ""
+                seq = ""
+            else:
+                seq = seq + line if seq is not None else line
+    _flush()
+    return records
+
+
+def _parse_cdhit_clstr(clstr_path):
+    """
+    CD-HIT .clstr 파일 파싱.
+    반환: [[member_seq_id, ...], ...]  (클러스터별 멤버 seq_id 리스트)
+    """
+    clusters = []
+    current = []
+    with open(clstr_path) as f:
+        for line in f:
+            line = line.rstrip()
+            if line.startswith(">Cluster"):
+                if current:
+                    clusters.append(current)
+                current = []
+            else:
+                # 형식 예: "0\t300nt, >0...\t*"  또는  "1\t300nt, >60... at 98.00%"
+                start = line.find(">")
+                end = line.find("...", start)
+                if start != -1 and end != -1:
+                    member_id = line[start + 1:end]
+                    current.append(member_id)
+    if current:
+        clusters.append(current)
+    return clusters
+
+
 def run_cdhit_sort(fa_path, out_tsv, cdhit_c=0.70):
-    """CD-HIT 클러스터링 → SHAP score 내림차순 정렬 → TSV 저장."""
+    """
+    CD-HIT 클러스터링 → 클러스터별 SHAP 최대값 멤버를 대표 서열로 선별
+    → SHAP score 내림차순 정렬 → TSV 저장.
+
+    기존 방식은 cd-hit이 클러스터 내에서 임의로(=최초 입력 순서 기준) 고른
+    대표 서열을 그대로 사용했으나, 이 경우 fold 구성이나 top_n 등 입력 순서에
+    영향을 주는 요인에 따라 대표 서열이 달라질 수 있다. 이를 보완하기 위해
+    .clstr 파일로 클러스터 멤버십을 확인하고, 각 클러스터 내에서
+    shap_importance가 가장 큰 멤버를 대표 서열로 선정한다.
+    """
     cdhit_out = fa_path.replace(".fa", "_cdhit.fa")
+    clstr_path = cdhit_out + ".clstr"
 
     cmd = [
         "cd-hit",
@@ -188,33 +298,34 @@ def run_cdhit_sort(fa_path, out_tsv, cdhit_c=0.70):
     if result.returncode != 0:
         sys.exit("[ERROR] CD-HIT 실패:\n{}".format(result.stderr))
 
-    # ── Python으로 FASTA 파싱 (bioawk 불필요) ──
-    rows = []
-    seq_id = comment = seq = None
-    with open(cdhit_out) as f:
-        for line in f:
-            line = line.rstrip()
-            if line.startswith(">"):
-                if seq_id is not None:
-                    rows.append((seq_id, comment, seq))
-                parts = line[1:].split("\t", 1)
-                seq_id  = parts[0]
-                comment = parts[1] if len(parts) > 1 else ""
-                seq = ""
-            else:
-                seq = seq + line if seq is not None else line
-    if seq_id is not None:
-        rows.append((seq_id, comment, seq))
+    # ── 클러스터링 입력(fa_path)에 포함된 전체 후보의 shap_importance 맵 ──
+    all_records = _parse_fasta_with_shap(fa_path)
 
-    # SHAP score 파싱 및 내림차순 정렬
+    # ── .clstr 파싱: 클러스터별 멤버 seq_id 목록 ──
+    clusters = _parse_cdhit_clstr(clstr_path)
+    log("  CD-HIT 클러스터 수: {}".format(len(clusters)))
+
+    # ── 클러스터별 SHAP 최대값 멤버를 대표 서열로 선정 ──
     parsed = []
-    for sid, cmt, sequence in rows:
-        try:
-            shap_val = float(cmt.strip())
-        except ValueError:
-            shap_val = 0.0
-        parsed.append((sid, shap_val, sequence))
-    parsed.sort(key=lambda x: x[1], reverse=True)
+    for members in clusters:
+        best_id, best_shap, best_seq = None, None, None
+        for mid in members:
+            if mid not in all_records:
+                continue
+            shap_val, sequence = all_records[mid]
+            if best_shap is None or shap_val > best_shap:
+                best_id, best_shap, best_seq = mid, shap_val, sequence
+        if best_id is None:
+            continue
+        parsed.append((best_id, best_shap, best_seq))
+
+    # SHAP score 내림차순 정렬
+    # 2차 키로 seq_id(서열 해시)를 사용해, 동점(SHAP 값이 같은) 서열들 간의
+    # 상대 순서를 top_n/n_splits 등 입력 파라미터와 무관하게 고정한다.
+    # (Python sort는 stable sort이므로, 2차 키 없이는 동점 그룹 내 순서가
+    #  입력 리스트 순서 즉 .clstr/FASTA 등장 순서에 의존해 파라미터에 따라
+    #  달라질 수 있었다.)
+    parsed.sort(key=lambda x: (-x[1], x[0]))
 
     # ── TSV 저장: ID / SHAP score / k-mer 서열 ──
     with open(out_tsv, "w") as f:
@@ -222,7 +333,8 @@ def run_cdhit_sort(fa_path, out_tsv, cdhit_c=0.70):
         for sid, shap_val, sequence in parsed:
             f.write("{}\t{:.6f}\t{}\n".format(sid, shap_val, sequence))
 
-    log("  정렬 완료: {} ({} 대표 서열)".format(out_tsv, len(parsed)))
+    log("  정렬 완료: {} ({} 클러스터 대표 서열, 클러스터 내 SHAP 최대값 기준 선별)".format(
+        out_tsv, len(parsed)))
 
 
 # ──────────────────────────────────────────────
